@@ -1,184 +1,217 @@
-import sys
-import struct
 import time
 import math
-
+import struct
+import cv2
 import usb.core
 import usb.util
+import lgpio
 
-# 参数表：名字 -> (resid, cmdid, length, 权限, 数据类型)
+
+# ================================
+# XVF3800 DOA PARAMETERS
+# ================================
 PARAMETERS = {
-    "VERSION":             (48, 0, 3,  "ro", "uint8"),
-    "AEC_AZIMUTH_VALUES":  (33, 75, 16, "ro", "radians"),
-    "DOA_VALUE":           (20, 18, 4, "ro", "uint16"),
-    "REBOOT":              (48, 7, 1,  "wo", "uint8"),
+    "AEC_AZIMUTH_VALUES": (33, 75, 16, "ro", "radians"),
 }
 
-
 class ReSpeaker:
-    TIMEOUT = 100000  # USB 超时时间
+    TIMEOUT = 100000
 
     def __init__(self, dev):
         self.dev = dev
 
-    def write(self, name, data_list):
-        try:
-            data = PARAMETERS[name]
-        except KeyError:
-            return
-
-        if data[3] == "ro":
-            raise ValueError('{} is read-only'.format(name))
-        if len(data_list) != data[2]:
-            raise ValueError('{} value count is not {}'.format(name, data[2]))
-
-        windex = data[0]
-        wvalue = data[1]
-        data_type = data[4]
-        data_cnt = data[2]
-        payload = []
-
-        if data_type in ('float', 'radians'):
-            for i in range(data_cnt):
-                payload += struct.pack(b'f', float(data_list[i]))
-        elif data_type in ('char', 'uint8'):
-            for i in range(data_cnt):
-                payload += data_list[i].to_bytes(1, byteorder='little')
-        else:
-            for i in range(data_cnt):
-                payload += struct.pack(b'i', data_list[i])
-
-        self.dev.ctrl_transfer(
-            usb.util.CTRL_OUT
-            | usb.util.CTRL_TYPE_VENDOR
-            | usb.util.CTRL_RECIPIENT_DEVICE,
-            0,
-            wvalue,
-            windex,
-            payload,
-            self.TIMEOUT,
-        )
-
     def read(self, name):
-        try:
-            data = PARAMETERS[name]
-        except KeyError:
-            return
-
-        resid = data[0]
-        cmdid = 0x80 | data[1]  # 读命令 = 0x80 | cmdid
-        length = data[2] + 1    # 多 1 字节状态位
+        resid, cmdid_raw, length, _, dtype = PARAMETERS[name]
+        cmdid = 0x80 | cmdid_raw
+        length += 1  # add status byte
 
         response = self.dev.ctrl_transfer(
             usb.util.CTRL_IN
             | usb.util.CTRL_TYPE_VENDOR
             | usb.util.CTRL_RECIPIENT_DEVICE,
-            0,
-            cmdid,
-            resid,
-            length,
-            self.TIMEOUT,
+            0, cmdid, resid, length, self.TIMEOUT
         )
 
-        # 不同类型的解析方式
-        if data[4] == 'uint8':
-            result = response.tolist()
-        elif data[4] == 'radians':
-            byte_data = response.tobytes()
-            num_values = int((length - 1) / 4)
-            fmt = '<' + 'f' * num_values
-            result = struct.unpack(fmt, byte_data[1:length])
-        elif data[4] == 'uint16':
-            # 保留原始 uint8 列表，由我们自己拼 uint16
-            result = response.tolist()
-        else:
-            result = response.tolist()
+        data = response.tobytes()
 
-        return result
-
-    def close(self):
-        usb.util.dispose_resources(self.dev)
+        if dtype == "radians":
+            fmt = "<" + "f" * int((length - 1) / 4)
+            return struct.unpack(fmt, data[1:length])
+        return data[1:length]
 
 
-def find():
-    """
-    尝试多种 PID，或者至少匹配到任意 0x2886 设备
-    """
-    vids_pids = [
-        (0x2886, 0x001A),
-        (0x2886, 0x0018),
-    ]
-    for vid, pid in vids_pids:
-        dev = usb.core.find(idVendor=vid, idProduct=pid)
-        if dev:
-            return ReSpeaker(dev)
-
-    # 兜底：只按 Vendor ID 找
+def find_respeaker():
     dev = usb.core.find(idVendor=0x2886)
-    if dev:
-        return ReSpeaker(dev)
-
-    return None
+    return ReSpeaker(dev) if dev else None
 
 
+# ================================
+# STEPPER MOTOR SETTINGS
+# ================================
+# Pins (BCM numbering)
+IN1 = 23
+IN2 = 24
+IN3 = 25
+IN4 = 16
+PINS = [IN1, IN2, IN3, IN4]
+
+# Half-step sequence (8-step)
+SEQ = [
+    [1,0,0,0],
+    [1,1,0,0],
+    [0,1,0,0],
+    [0,1,1,0],
+    [0,0,1,0],
+    [0,0,1,1],
+    [0,0,0,1],
+    [1,0,0,1],
+]
+
+CHIP = 0
+
+
+STEPS_PER_REV = 800
+
+STEP_DELAY = 0.0015
+MIN_MOVE_DEG = 5.0
+EXTRA_SETTLE = 0.30
+
+# Camera mounting offset relative to mic DOA reference
+CAMERA_OFFSET_DEG = 0.0
+
+current_angle_deg = 0.0
+busy_until = 0.0
+
+
+# ================================
+# HELPER FUNCTIONS
+# ================================
+def normalize(angle):
+    """Normalize angle to 0–360 degrees."""
+    return (angle + 360) % 360
+
+def angle_to_steps(delta_deg):
+    """Convert degrees to stepper motor steps."""
+    return int(delta_deg * (STEPS_PER_REV / 360.0))
+
+
+# ================================
+# STEPPER MOTOR CONTROL
+# ================================
+def stepper_setup():
+    """Initialize GPIO for the stepper motor."""
+    global h
+    h = lgpio.gpiochip_open(CHIP)
+    for p in PINS:
+        lgpio.gpio_claim_output(h, p, 0)
+
+def stepper_cleanup():
+    """Release GPIO pins."""
+    for p in PINS:
+        try:
+            lgpio.gpio_write(h, p, 0)
+            lgpio.gpio_free(h, p)
+        except:
+            pass
+    lgpio.gpiochip_close(h)
+
+def move_steps(steps):
+    """Rotate motor by given steps. Positive = CW, Negative = CCW."""
+    if steps == 0:
+        return
+
+    direction = 1 if steps > 0 else -1
+    seq = SEQ[::direction]
+
+    for _ in range(abs(steps)):
+        for patt in seq:
+            for pin, val in zip(PINS, patt):
+                lgpio.gpio_write(h, pin, val)
+            time.sleep(STEP_DELAY)
+
+
+# ================================
+# MAIN LOOP — DOA + STEPPER + CAMERA
+# ================================
 def main():
-    dev = find()
+    global current_angle_deg, busy_until
+
+    # Initialize stepper
+    try:
+        stepper_setup()
+    except Exception as e:
+        print("Failed to initialize GPIO:", e)
+        return
+
+    # Initialize XVF3800 DOA mic
+    dev = find_respeaker()
     if not dev:
-        print('No XVF3800 device found')
-        sys.exit(1)
+        print("XVF3800 Microphone not found!")
+        return
 
-    # 读一下版本信息
-    version = dev.read("VERSION")
-    print('VERSION RAW:', version)
+    # Initialize camera
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    print("开始连续读取 DOA_VALUE 和 AEC_AZIMUTH_VALUES，按 Ctrl+C 结束。\n")
+    if not cap.isOpened():
+        print("Failed to open camera!")
+        return
+
+    print("\n=== DOA + Stepper Motor + Camera System Started ===")
+    print("Press Q to exit.\n")
 
     try:
         while True:
-            # 1) 原始 DOA_VALUE
-            doa = dev.read("DOA_VALUE")
-            print("RAW DOA_VALUE:", doa)
 
-            if doa and len(doa) > 0:
-                status = doa[0]
+            # ===== CAMERA FRAME (non-blocking) =====
+            ret, frame = cap.read()
+            if ret:
+                cv2.imshow("Camera View", frame)
 
-                # 角度拼成 uint16（低 8 位 + 高 8 位）
-                angle_raw = None
-                if len(doa) >= 3:
-                    angle_raw = doa[1] | (doa[2] << 8)
-                elif len(doa) >= 2:
-                    angle_raw = doa[1]
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-                speech_flag = doa[3] if len(doa) > 3 else None
+            now = time.time()
 
-                print(
-                    f"[DOA_VALUE] status={status}, "
-                    f"speech_flag={speech_flag}, "
-                    f"angle_raw={angle_raw}"
-                )
+            # Stepper is busy, wait before next DOA reading
+            if now < busy_until:
+                continue
 
-            # 2) AEC_AZIMUTH_VALUES（弧度 → 角度）
-            az_values = dev.read("AEC_AZIMUTH_VALUES")
-            if az_values and len(az_values) > 0:
-                angle0_deg = az_values[0] * 180.0 / math.pi
-                if len(az_values) > 1:
-                    angle1_deg = az_values[1] * 180.0 / math.pi
-                    print(
-                        f"[AZIMUTH] angle0={angle0_deg:.1f}°, "
-                        f"angle1={angle1_deg:.1f}°"
-                    )
-                else:
-                    print(f"[AZIMUTH] angle0={angle0_deg:.1f}°")
+            # ===== READ DOA =====
+            vals = dev.read("AEC_AZIMUTH_VALUES")
+            doa_rad = vals[1]
+            doa_deg = normalize(doa_rad * 180 / math.pi)
 
-            print("-" * 40)
-            time.sleep(0.5)
+            target_deg = normalize(doa_deg + CAMERA_OFFSET_DEG)
+
+            # ===== NEW LOGIC: DO NOT COMPUTE SHORTEST PATH =====
+            delta_deg = target_deg - current_angle_deg
+
+            print(f"DOA={doa_deg:.1f}° Current={current_angle_deg:.1f}° Target={target_deg:.1f}° Δ={delta_deg:.1f}°")
+
+            # Ignore small movement
+            if abs(delta_deg) < MIN_MOVE_DEG:
+                continue
+
+            steps = angle_to_steps(delta_deg)
+            move_steps(steps)
+
+            # Update angle (keep it 0-360)
+            current_angle_deg = normalize(current_angle_deg + delta_deg)
+
+            # Motor settle time
+            busy_until = time.time() + EXTRA_SETTLE
 
     except KeyboardInterrupt:
-        print("\n停止读取，退出程序。")
+        print("Interrupted by user.")
 
     finally:
-        dev.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        stepper_cleanup()
+        print("System exited. GPIO released.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
