@@ -1,4 +1,4 @@
-25599350144096431
+25604641568378370
 Audio_Module
 Reverb_BTDR-1H
 Digital Reverberation Unit, http://www.belton.co.kr/inc/downfile.php?seq=17&file=pdf (footprint from http://www.uk-electronic.de/PDF/BTDR-1.pdf)
@@ -102648,9 +102648,30 @@ XVF3800 dock slot header mounting
 18
 17
 XVF_3800_Dock
+Untitled
+
+
+0
+2
+2
+XVF_3800_Dock
 XVF3800_Dock_2x8_Slot_M3
 Dock footprint for XVF3800 module: 2x8 2.54mm header + keepout + M3 holes + board-edge guide
 XVF3800 dock slot header mounting
 0
 18
 17
+XVF_3800_Dock
+barrel_jack_5.5_2.1
+
+
+0
+3
+3
+XVF_3800_Dock
+rap5
+
+
+0
+40
+40
